@@ -16,8 +16,8 @@ import torch
 # Relative path: src/main.py → src/model_save/best.pt
 
 #MODEL_PATH = Path(r"F:/VS Code Storage/ChessHacks/src/model_save/last.pt")
-#MODEL_PATH = Path(r"F:/VS Code Storage/ChessHacks/src/model_save/last.pt")
-MODEL_PATH = Path(r"F:/VS Code Storage/ChessHacks/src/model_save/best_selfplay.pt")
+#MODEL_PATH = Path(r"F:/VS Code Storage/ChessHacks\src/model_save/best5.8829.pt")
+MODEL_PATH = Path(r"F:/VS Code Storage/ChessHacks\src/model_save\best.pt")
 
 
 NUM_PLANES = 18
