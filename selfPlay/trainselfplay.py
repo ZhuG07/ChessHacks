@@ -1,4 +1,4 @@
-# training/selfplay/train_selfplay_from_npz.py
+# training/selfplay/trainselfplay.py
 
 from pathlib import Path
 import numpy as np
@@ -7,7 +7,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from .config import (
-    MODEL_PATH,
+    MODEL_PATH,       # this is your supervised best.pt
     SELFPLAY_OUT_DIR,
     NUM_PLANES,
     POLICY_DIM,
@@ -16,16 +16,44 @@ from .config import (
 
 from src.model import ResNet20_PolicyDelta
 
+# RL-specific weights live here:
+RL_MODEL_PATH = MODEL_PATH.parent / "best_selfplay.pt"
+
+# Match the supervised trainer config
+CP_CLIP = 1500.0
+CP_NL_CLIP = 800.0
+CP_NL_DIV = 400.0
+
+W_DELTA = 0.5
+W_CP = 1.0
+W_RESULT = 0.25
+
 
 class SelfPlayNPZDataset(Dataset):
-    def __init__(self, npz_path: Path, cp_scale: float = CP_SCALE):
+    def __init__(self, npz_path: Path):
         data = np.load(npz_path)
+
         self.X = data["X"]  # (N, 18, 8, 8)
         self.policy_best_idx = data["policy_best_idx"]  # (N,)
-        self.cp_before = data["cp_before"]  # (N,)
-        self.delta_cp = data["delta_cp"]  # (N,)
-        self.result = data["result"]  # (N,)
-        self.cp_scale = cp_scale
+        cp_before = data["cp_before"].astype(np.float32)
+        cp_after = data["cp_after_best"].astype(np.float32)
+        delta_cp = data["delta_cp"].astype(np.float32)
+        result = data["result"].astype(np.float32)
+
+        # -----------------------------
+        # CP target shaping (same as train.py)
+        # -----------------------------
+        cp_bounded = np.clip(cp_before, -CP_NL_CLIP, CP_NL_CLIP)
+        self.cp_scaled = np.tanh(cp_bounded / CP_NL_DIV).astype(np.float32)
+
+        # -----------------------------
+        # Delta scaling (same as train.py)
+        # -----------------------------
+        delta_clipped = np.clip(delta_cp, -CP_CLIP, CP_CLIP)
+        self.delta_scaled = (delta_clipped / CP_SCALE).astype(np.float32)
+
+        # Result (no discounting here, RL is already close to terminal)
+        self.result = result.astype(np.float32)
 
     def __len__(self):
         return self.X.shape[0]
@@ -33,26 +61,22 @@ class SelfPlayNPZDataset(Dataset):
     def __getitem__(self, idx):
         x = self.X[idx].astype(np.float32)
         policy_idx = int(self.policy_best_idx[idx])
-        cp_before = float(self.cp_before[idx])
-        delta_cp = float(self.delta_cp[idx])
-        result = float(self.result[idx])  # [-1,1]
-
-        # scale cp targets consistently with model
-        cp_target_scaled = cp_before / self.cp_scale
-        delta_target_scaled = delta_cp / self.cp_scale
+        cp_s = float(self.cp_scaled[idx])
+        delta_s = float(self.delta_scaled[idx])
+        res = float(self.result[idx])
 
         return (
-            torch.from_numpy(x),         # (18,8,8)
-            torch.tensor(policy_idx),    # ()
-            torch.tensor(cp_target_scaled, dtype=torch.float32),
-            torch.tensor(delta_target_scaled, dtype=torch.float32),
-            torch.tensor(result, dtype=torch.float32),
+            torch.from_numpy(x),              # (18,8,8)
+            torch.tensor(policy_idx),        # ()
+            torch.tensor(cp_s, dtype=torch.float32),
+            torch.tensor(delta_s, dtype=torch.float32),
+            torch.tensor(res, dtype=torch.float32),
         )
 
 
 def train_selfplay_model(
     npz_path: Path,
-    out_model_path: Path,
+    out_model_path: Path = RL_MODEL_PATH,
     batch_size: int = 256,
     epochs: int = 5,
     lr: float = 1e-4,
@@ -68,13 +92,17 @@ def train_selfplay_model(
         cp_scale=CP_SCALE,
     ).to(device)
 
-    # Load starting weights (pull last best weights as init)
-    if MODEL_PATH.is_file():
-        print(f"[TRAIN] Loading initial weights from {MODEL_PATH}")
+    # Prefer RL weights if they exist, otherwise fall back to supervised best.pt
+    if RL_MODEL_PATH.is_file():
+        print(f"[TRAIN] Loading initial weights from RL model {RL_MODEL_PATH}")
+        state = torch.load(RL_MODEL_PATH, map_location="cpu")
+        model.load_state_dict(state, strict=False)
+    elif MODEL_PATH.is_file():
+        print(f"[TRAIN] RL weights not found, loading supervised weights from {MODEL_PATH}")
         state = torch.load(MODEL_PATH, map_location="cpu")
         model.load_state_dict(state, strict=False)
     else:
-        print(f"[TRAIN] WARNING: MODEL_PATH {MODEL_PATH} not found; training from scratch.")
+        print(f"[TRAIN] WARNING: Neither {RL_MODEL_PATH} nor {MODEL_PATH} found; training from scratch.")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     ce_loss = nn.CrossEntropyLoss()
@@ -110,7 +138,7 @@ def train_selfplay_model(
             # Policy loss: cross-entropy over POLICY_DIM vs policy_idx
             policy_loss = ce_loss(policy_logits, policy_idx)
 
-            # cp loss: MSE in scaled space
+            # cp loss: MSE in scaled space ([-1,1])
             cp_loss = mse_loss(cp_scaled_pred, cp_target_scaled)
 
             # delta loss: MSE in scaled space
@@ -119,7 +147,12 @@ def train_selfplay_model(
             # result loss: MSE in [-1,1]
             result_loss = mse_loss(result_pred, result_target)
 
-            loss = policy_loss + cp_loss + delta_loss + result_loss
+            loss = (
+                policy_loss
+                + W_CP * cp_loss
+                + W_DELTA * delta_loss
+                + W_RESULT * result_loss
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -142,11 +175,10 @@ def train_selfplay_model(
             f"result={total_result_loss / count:.4f}"
         )
 
-    print(f"[TRAIN] Saving fine-tuned model to {out_model_path}")
+    print(f"[TRAIN] Saving fine-tuned RL model to {out_model_path}")
     torch.save(model.state_dict(), out_model_path)
 
 
 if __name__ == "__main__":
     npz_file = SELFPLAY_OUT_DIR / "selfplay_sf_topk_dataset.npz"
-    out_model = MODEL_PATH.parent / "best_selfplay.pt"
-    train_selfplay_model(npz_file, out_model)
+    train_selfplay_model(npz_file)

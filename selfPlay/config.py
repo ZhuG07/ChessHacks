@@ -25,7 +25,7 @@ CP_SCALE = 200.0
 # Self-play config
 TOP_K_MOVES = 5          # how many NN moves per position for Stockfish evaluation
 MAX_MOVES_PER_GAME = 300
-NUM_GAMES = 50           # number of self-play games per run (tune)
+NUM_GAMES = 1           # number of self-play games per run (tune)
 SF_TIME_LIMIT = 0.05     # seconds per Stockfish evaluation (tune)
 POLICY_TEMP_CP = 120.0   # temperature for cp->policy softmax
 

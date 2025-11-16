@@ -8,6 +8,10 @@ import numpy as np
 import chess
 import torch  # OK to keep; used by the engine, and harmless here
 
+# How often to deliberately play a bad move (to learn to handle blunders)
+BLUNDER_PLAY_PROB = 0.25         # 25% of the time we play a "bad" move
+BLUNDER_CP_DROP_THRESHOLD = 150  # centipawns worse than best to qualify as a blunder
+
 from .config import (
     SELFPLAY_OUT_DIR,
     MODEL_PATH,
@@ -90,6 +94,16 @@ def _interesting_weight(
     return max(1, min(weight, 5))
 
 
+def _would_cause_threefold(board: chess.Board, move: chess.Move) -> bool:
+    """
+    Check if playing `move` would allow a threefold repetition claim.
+    """
+    board.push(move)
+    can = board.can_claim_threefold_repetition()
+    board.pop()
+    return can
+
+
 def play_one_selfplay_game(
     engine: PolicyOnlyEngine,
     sf: StockfishEvaluator,
@@ -107,6 +121,10 @@ def play_one_selfplay_game(
     """
     Play a single self-play game with your NN+alpha-beta engine as the actor
     and Stockfish as the critic on top-K root moves.
+
+    CHECKMATE-ONLY:
+      - If the game does not end in checkmate, this function returns
+        empty lists, so no positions from that game are added to the dataset.
 
     Returns lists over plies:
       - planes_list:      list of (18, 8, 8) float32
@@ -204,21 +222,86 @@ def play_one_selfplay_game(
         w = _interesting_weight(board, best_sf_move, cp_before, best_sf_cp)
         weight_list.append(w)
 
+        # ------------------------------------------------------------------
         # Decide which move to actually PLAY in self-play:
-        #  - Opening: more exploration for uncommon lines
-        #  - Later: mainly follow engine best
-        if board.fullmove_number <= 12:
-            explore_prob = 0.4  # 60% best, 40% explore
-        else:
-            explore_prob = 0.2  # 80% best, 20% explore
+        #
+        # Goals:
+        #   - Mostly play strong moves (so games are sane).
+        #   - Sometimes deliberately play a *bad* move so the engine learns:
+        #       * how to punish blunders
+        #       * how to defend after its own blunders
+        #   - When Stockfish says "mate", ALWAYS follow the mating line.
+        #   - Avoid threefold repetition when possible.
+        # ------------------------------------------------------------------
 
-        if random.random() < (1.0 - explore_prob):
-            chosen = best_move
+        r = random.random()
+        chosen: chess.Move
+
+        # 1) If SF says this move is essentially mate (or near-mate),
+        #    ALWAYS follow best_sf_move to ensure clean mating sequences.
+        if abs(best_sf_cp) >= 90_000:
+            chosen = best_sf_move
+
         else:
-            chosen = random.choices(legal_moves, weights=probs.tolist(), k=1)[0]
+            # 2) Otherwise, we mix blunders and normal exploration.
+
+            if r < BLUNDER_PLAY_PROB and len(topk_moves) > 1:
+                # --- BLUNDER MODE ---
+                # Find moves that are clearly worse than the best SF move
+                best_cp = float(cp_after[best_sf_idx_local])
+                cp_drop = best_cp - cp_after  # positive if worse than best
+
+                # Indices where move is "bad enough"
+                blunder_indices = np.where(cp_drop >= BLUNDER_CP_DROP_THRESHOLD)[0]
+
+                if blunder_indices.size == 0:
+                    # If no clearly bad moves in top-K, just take the worst among them
+                    worst_idx_local = int(cp_after.argmin())
+                    chosen = topk_moves[worst_idx_local]
+                else:
+                    # Randomly pick one of the clearly bad moves
+                    idx_local = int(np.random.choice(blunder_indices))
+                    chosen = topk_moves[idx_local]
+
+            else:
+                # --- NORMAL MODE ---
+                # Opening: more exploration for uncommon lines
+                if board.fullmove_number <= 12:
+                    explore_prob = 0.4  # 60% best, 40% explore
+                else:
+                    explore_prob = 0.2  # 80% best, 20% explore
+
+                if random.random() < (1.0 - explore_prob):
+                    # Play engine/search best move (which is often SF-best too)
+                    chosen = best_move
+                else:
+                    # Sample from NN's move distribution for diversity
+                    chosen = random.choices(
+                        legal_moves,
+                        weights=probs.tolist(),
+                        k=1
+                    )[0]
+
+        # 3) Avoid causing threefold repetition if we can
+        if _would_cause_threefold(board, chosen):
+            alt_moves = [m for m in legal_moves if m != chosen and not _would_cause_threefold(board, m)]
+            if alt_moves:
+                chosen = random.choice(alt_moves)
 
         board.push(chosen)
         move_count += 1
+
+    # ------------------------------------------------------------------
+    # CHECKMATE-ONLY FILTER
+    # ------------------------------------------------------------------
+
+    # If the game ended by move limit and is not technically game-over,
+    # or it is over but not by checkmate (stalemate, repetition, etc.),
+    # we discard this game entirely.
+    if not board.is_game_over() or not board.is_checkmate():
+        # No usable data from this game
+        print("[SELFPLAY] Game ended without checkmate; discarding positions from this game.")
+        return [], [], [], [], [], [], []
 
     # At the end of the game, we compute result per position.
     result_str = board.result()  # e.g. "1-0", "0-1", "1/2-1/2"
@@ -256,6 +339,8 @@ def generate_selfplay_npz(
     """
     Generate a self-play + Stockfish-labeled dataset and save it to `out_path`.
     The network used is loaded via PolicyOnlyEngine / MODEL_PATH.
+
+    Only positions from games that end in CHECKMATE are included.
     """
     print(f"[SELFPLAY] Loading NN engine from {MODEL_PATH}")
     engine = PolicyOnlyEngine()  # uses your existing CONFIG + MODEL_PATH in src/main.py
@@ -288,6 +373,10 @@ def generate_selfplay_npz(
                 max_moves=max_moves,
             )
 
+            # If this game was discarded (non-checkmate), skip
+            if not planes_list:
+                continue
+
             for i in range(len(planes_list)):
                 # Duplicate positions according to their weight to emphasize
                 # good checks / mates / mid/endgame.
@@ -305,9 +394,30 @@ def generate_selfplay_npz(
             print("[SELFPLAY] No positions generated; aborting.")
             return
 
+        # Stack X
         X_arr = np.stack(X_all).astype(np.float32)
         policy_best_idx_arr = np.array(policy_best_idx_all, dtype=np.int64)
-        policy_topk_idx_arr = np.stack(policy_topk_idx_all).astype(np.int64)
+
+        # ------------------------------------------------------------------
+        # policy_topk_idx_all is a list of arrays of length k, where
+        #   k = min(TOP_K_MOVES, len(legal_moves)) at that position.
+        # In endgames or forced positions, len(legal_moves) < TOP_K_MOVES,
+        # so the arrays have different lengths and np.stack() fails.
+        #
+        # Fix: pad each array with -1 up to max_k, then stack.
+        # (-1 means "no move here" — you can safely ignore or mask later.)
+        # ------------------------------------------------------------------
+        max_k = max(arr.shape[0] for arr in policy_topk_idx_all)
+
+        policy_topk_idx_padded = []
+        for arr in policy_topk_idx_all:
+            if arr.shape[0] < max_k:
+                pad_len = max_k - arr.shape[0]
+                pad = -np.ones(pad_len, dtype=np.int64)
+                arr = np.concatenate([arr, pad])
+            policy_topk_idx_padded.append(arr)
+
+        policy_topk_idx_arr = np.stack(policy_topk_idx_padded).astype(np.int64)
 
         cp_before_arr = np.array(cp_before_all, dtype=np.float32)
         cp_after_best_arr = np.array(cp_after_best_all, dtype=np.float32)
