@@ -28,9 +28,9 @@ import random
 # ============================================================================
 
 class Config:
-    DATASET_FOLDER = r"training\whiteNoise/processed"
-    OUTPUT_DIR = "checkpoints_resnet20_trained_models"
-    EPOCHS = 20
+    DATASET_FOLDER = "F:/VS Code Storage/ChessHacks/processed"
+    OUTPUT_DIR = "./checkpoints_delta_resnet20"
+    EPOCHS = 15
     BATCH_SIZE = 64
     LR = 3e-4
     NUM_WORKERS = 0
@@ -206,6 +206,8 @@ class ResNet20_PolicyDelta(nn.Module):
         for _ in range(9):
             blocks.append(BasicBlock(trunk_channels, trunk_channels))
         self.trunk = nn.Sequential(*blocks)
+     
+
 
         # Global pooling
         self.avg = nn.AdaptiveAvgPool2d((1, 1))
