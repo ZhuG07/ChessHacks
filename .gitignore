@@ -6,3 +6,5 @@ venv
 devtools
 src/model_save/best_selfplay.pt
 src/model_save/best_selfplay.pt
+src/checkpoints_delta_resnet20/best.pt
+src/checkpoints_delta_resnet20/last.pt
