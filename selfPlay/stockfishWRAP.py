@@ -1,4 +1,4 @@
-# training/selfplay/stockfish_wrapper.py
+# training/selfplay/stockfishWRAP.py
 
 from pathlib import Path
 import chess
@@ -12,17 +12,23 @@ class StockfishEvaluator:
     for self-play labeling.
     """
 
-    def __init__(self, engine_path: str | Path = STOCKFISH_PATH, time_limit: float = 0.05, depth: int | None = None):
+    def __init__(
+        self,
+        engine_path: str | Path = STOCKFISH_PATH,
+        time_limit: float = 0.05,
+        depth: int | None = None,
+    ):
         self.engine_path = str(engine_path)
         self.time_limit = float(time_limit)
         self.depth = depth
 
-        self.engine = chess.engine.SimpleEngine.popen_uci(str(self.engine_path))
+        self.engine = chess.engine.SimpleEngine.popen_uci(self.engine_path)
 
     def evaluate_cp(self, board: chess.Board) -> int:
         """
         Evaluate the position from the perspective of the side to move.
         Returns centipawns (positive = good for side to move).
+        Mates are mapped to large cp magnitude with sign.
         """
         if self.depth is not None:
             limit = chess.engine.Limit(depth=self.depth)
@@ -30,14 +36,14 @@ class StockfishEvaluator:
             limit = chess.engine.Limit(time=self.time_limit)
 
         info = self.engine.analyse(board, limit=limit)
-
         score = info["score"].pov(board.turn)
+
         if score.is_mate():
-            # map mate distance to large cp (sign only matters)
             sign = 1 if score.mate() > 0 else -1
-            return 100000 * sign
+            return 100_000 * sign
         else:
-            return score.score(mate_score=100000)
+            # centipawns; mate_score ensures large values for near-mates
+            return score.score(mate_score=100_000)
 
     def close(self):
         try:

@@ -1,7 +1,6 @@
 # training/selfplay/train_selfplay_from_npz.py
 
 from pathlib import Path
-import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -15,7 +14,8 @@ from .config import (
     CP_SCALE,
 )
 
-from ..src.model import ResNet20_PolicyDelta
+from src.model import ResNet20_PolicyDelta
+
 
 class SelfPlayNPZDataset(Dataset):
     def __init__(self, npz_path: Path, cp_scale: float = CP_SCALE):
@@ -63,16 +63,18 @@ def train_selfplay_model(
     dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
 
     model = ResNet20_PolicyDelta(
-        planes=NUM_PLANES,
+        in_planes=NUM_PLANES,
         policy_dim=POLICY_DIM,
         cp_scale=CP_SCALE,
     ).to(device)
 
-    # Load starting weights
+    # Load starting weights (pull last best weights as init)
     if MODEL_PATH.is_file():
         print(f"[TRAIN] Loading initial weights from {MODEL_PATH}")
         state = torch.load(MODEL_PATH, map_location="cpu")
         model.load_state_dict(state, strict=False)
+    else:
+        print(f"[TRAIN] WARNING: MODEL_PATH {MODEL_PATH} not found; training from scratch.")
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     ce_loss = nn.CrossEntropyLoss()

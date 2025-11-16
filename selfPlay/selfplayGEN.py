@@ -2,12 +2,11 @@
 
 import random
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple
 
 import numpy as np
 import chess
-
-import torch
+import torch  # OK to keep; used by the engine, and harmless here
 
 from .config import (
     SELFPLAY_OUT_DIR,
@@ -18,13 +17,14 @@ from .config import (
     SF_TIME_LIMIT,
     POLICY_TEMP_CP,
     CP_SCALE,
+    SELFPLAY_ENGINE_DEPTH,
 )
-from stockfishWRAP import StockfishEvaluator
 
-# Adjust this import to match your project layout:
-# If engine.py sits under something like `submission/engine.py`, use that path.
-from ..src.main import (
-    NN_Policy,
+from .stockfishWRAP import StockfishEvaluator
+
+# Engine / model side
+from src.main import (
+    PolicyOnlyEngine,
     board_to_planes,
     move_to_index,
     POLICY_DIM,
@@ -48,23 +48,74 @@ def softmax_from_cp(cp_values: np.ndarray, temp_cp: float) -> np.ndarray:
     return exps / Z
 
 
+def _interesting_weight(
+    board: chess.Board,
+    best_sf_move: chess.Move,
+    cp_before: float,
+    cp_after_best: float,
+) -> int:
+    """
+    Simple reward shaping via sample weighting:
+      - midgame / endgame emphasized
+      - bonuses for good checks and mating lines
+    Returns an integer >= 1 used to duplicate the sample.
+    """
+
+    weight = 1
+
+    # Game phase: emphasize midgame & endgame
+    fullmove = board.fullmove_number
+    if fullmove >= 12:
+        weight += 1        # midgame
+    if fullmove >= 25:
+        weight += 1        # deeper endgame
+
+    # Check / mate bonuses
+    # Check if best SF move gives check
+    board.push(best_sf_move)
+    is_check = board.is_check()
+    board.pop()
+
+    cp_gain = cp_after_best - cp_before
+
+    # Good checking move (check + eval improves a bit)
+    if is_check and cp_gain > 30:
+        weight += 1
+
+    # Near-mate or mate (our wrapper uses ±100000 for mates)
+    if abs(cp_after_best) >= 90_000:
+        weight += 3
+
+    # Cap the weight to avoid insane duplication
+    return max(1, min(weight, 5))
+
+
 def play_one_selfplay_game(
-    engine: NNEvalEngine,
+    engine: PolicyOnlyEngine,
     sf: StockfishEvaluator,
     top_k: int,
     max_moves: int,
-) -> Tuple[list, list, list, list, list]:
+) -> Tuple[
+    list[np.ndarray],
+    list[int],
+    list[np.ndarray],
+    list[float],
+    list[float],
+    list[float],
+    list[int],
+]:
     """
     Play a single self-play game with your NN+alpha-beta engine as the actor
     and Stockfish as the critic on top-K root moves.
 
     Returns lists over plies:
-      - planes_list:     list of (18, 8, 8) float32
-      - policy_best_idx: list of ints (Stockfish-best among top-K)
-      - policy_topk_idx: list of np.array(K,) of ints
-      - cp_before_list:  list of floats
-      - cp_after_best:   list of floats
-    Result labels (game outcome) are computed later after game end.
+      - planes_list:      list of (18, 8, 8) float32
+      - policy_best_idx:  list of ints (Stockfish-best among top-K)
+      - policy_topk_idx:  list of np.array(K,) of ints
+      - cp_before_list:   list of floats
+      - cp_after_best:    list of floats
+      - result_list:      list of floats (game outcome from stm POV)
+      - weight_list:      list of ints (sample duplication weight)
     """
 
     board = chess.Board()
@@ -74,6 +125,7 @@ def play_one_selfplay_game(
     policy_topk_idx_list: list[np.ndarray] = []
     cp_before_list: list[float] = []
     cp_after_best_list: list[float] = []
+    weight_list: list[int] = []
 
     move_count = 0
 
@@ -87,21 +139,28 @@ def play_one_selfplay_game(
         if not legal_moves:
             break
 
-        # ask your engine for move + root probs
-        engine.note_position(board)
-        best_move, probs_dict = engine.select_move(board)
+        # Ask your engine for move + root probs (search-based)
+        # Use a shallower depth for self-play than for tournaments for speed.
+        best_move, probs_dict = engine.search_best_move(
+            board,
+            max_depth=SELFPLAY_ENGINE_DEPTH,
+        )
         if best_move is None:
+            # Safety fallback: random legal move
             best_move = random.choice(legal_moves)
 
-        # ensure probs over legal moves
-        probs = np.array([probs_dict.get(mv, 0.0) for mv in legal_moves], dtype=np.float32)
+        # Ensure probs over legal moves
+        probs = np.array(
+            [probs_dict.get(mv, 0.0) for mv in legal_moves],
+            dtype=np.float32,
+        )
         Z = probs.sum()
         if Z <= 0:
             probs[:] = 1.0 / len(legal_moves)
         else:
             probs /= Z
 
-        # choose top-K moves by engine's probability (actor's proposal set)
+        # Choose top-K moves by engine's probability (actor's proposal set)
         sorted_indices = np.argsort(-probs)
         k = min(top_k, len(legal_moves))
         topk_indices = sorted_indices[:k]
@@ -123,14 +182,15 @@ def play_one_selfplay_game(
         best_sf_move = topk_moves[best_sf_idx_local]
         best_sf_cp = float(cp_after[best_sf_idx_local])
 
-        # build sparse policy target info
+        # build sparse policy target info (indices into global POLICY_DIM space)
         policy_topk_idx = np.array(
             [move_to_index(mv) for mv in topk_moves],
             dtype=np.int64,
         )
 
-        # we compute a soft distribution over top-K from cp_after
-        policy_topk_prob = softmax_from_cp(cp_after, temp_cp=POLICY_TEMP_CP)
+        # (Optional) soft distribution over top-K from cp_after
+        _policy_topk_prob = softmax_from_cp(cp_after, temp_cp=POLICY_TEMP_CP)
+        # NOTE: we don't store it yet; you can extend NPZ later to use it.
 
         # record features & labels (except game result)
         planes = board_to_planes(board)
@@ -140,9 +200,19 @@ def play_one_selfplay_game(
         cp_before_list.append(float(cp_before))
         cp_after_best_list.append(best_sf_cp)
 
-        # decide which move to actually PLAY in self-play:
-        # small exploration: 80% best_move, 20% sample from probs
-        if random.random() < 0.8:
+        # reward-shaping weight for this sample
+        w = _interesting_weight(board, best_sf_move, cp_before, best_sf_cp)
+        weight_list.append(w)
+
+        # Decide which move to actually PLAY in self-play:
+        #  - Opening: more exploration for uncommon lines
+        #  - Later: mainly follow engine best
+        if board.fullmove_number <= 12:
+            explore_prob = 0.4  # 60% best, 40% explore
+        else:
+            explore_prob = 0.2  # 80% best, 20% explore
+
+        if random.random() < (1.0 - explore_prob):
             chosen = best_move
         else:
             chosen = random.choices(legal_moves, weights=probs.tolist(), k=1)[0]
@@ -172,6 +242,7 @@ def play_one_selfplay_game(
         cp_before_list,
         cp_after_best_list,
         result_list,
+        weight_list,
     )
 
 
@@ -184,16 +255,16 @@ def generate_selfplay_npz(
 ):
     """
     Generate a self-play + Stockfish-labeled dataset and save it to `out_path`.
-    The network used is loaded via NNEvalEngine / MODEL_PATH.
+    The network used is loaded via PolicyOnlyEngine / MODEL_PATH.
     """
     print(f"[SELFPLAY] Loading NN engine from {MODEL_PATH}")
-    engine = NNEvalEngine()  # uses your existing CONFIG + MODEL_PATH
+    engine = PolicyOnlyEngine()  # uses your existing CONFIG + MODEL_PATH in src/main.py
+    engine.reset()
     sf = StockfishEvaluator(time_limit=sf_time_limit)
 
     X_all: list[np.ndarray] = []
     policy_best_idx_all: list[int] = []
     policy_topk_idx_all: list[np.ndarray] = []
-    policy_topk_prob_all: list[np.ndarray] = []
     cp_before_all: list[float] = []
     cp_after_best_all: list[float] = []
     delta_cp_all: list[float] = []
@@ -209,6 +280,7 @@ def generate_selfplay_npz(
                 cp_before_list,
                 cp_after_best_list,
                 result_list,
+                weight_list,
             ) = play_one_selfplay_game(
                 engine=engine,
                 sf=sf,
@@ -217,13 +289,17 @@ def generate_selfplay_npz(
             )
 
             for i in range(len(planes_list)):
-                X_all.append(planes_list[i])
-                policy_best_idx_all.append(policy_best_idx_list[i])
-                policy_topk_idx_all.append(policy_topk_idx_list[i])
-                cp_before_all.append(cp_before_list[i])
-                cp_after_best_all.append(cp_after_best_list[i])
-                delta_cp_all.append(cp_after_best_list[i] - cp_before_list[i])
-                result_all.append(result_list[i])
+                # Duplicate positions according to their weight to emphasize
+                # good checks / mates / mid/endgame.
+                repeat = max(1, int(weight_list[i]))
+                for _ in range(repeat):
+                    X_all.append(planes_list[i])
+                    policy_best_idx_all.append(policy_best_idx_list[i])
+                    policy_topk_idx_all.append(policy_topk_idx_list[i])
+                    cp_before_all.append(cp_before_list[i])
+                    cp_after_best_all.append(cp_after_best_list[i])
+                    delta_cp_all.append(cp_after_best_list[i] - cp_before_list[i])
+                    result_all.append(result_list[i])
 
         if not X_all:
             print("[SELFPLAY] No positions generated; aborting.")
@@ -232,13 +308,6 @@ def generate_selfplay_npz(
         X_arr = np.stack(X_all).astype(np.float32)
         policy_best_idx_arr = np.array(policy_best_idx_all, dtype=np.int64)
         policy_topk_idx_arr = np.stack(policy_topk_idx_all).astype(np.int64)
-
-        # For now we recompute policy_topk_prob from cp_after within each game;
-        # alternatively, store them during play_one_selfplay_game.
-        # Simpler version: uniform over top-K SF-labeled moves.
-        # But better: use cp_after; let's rebuild:
-        # For memory reasons, we’ll store only indices and let training
-        # reconstruct per-position probabilities if desired.
 
         cp_before_arr = np.array(cp_before_all, dtype=np.float32)
         cp_after_best_arr = np.array(cp_after_best_all, dtype=np.float32)
