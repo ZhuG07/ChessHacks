@@ -4,3 +4,5 @@ venv
 .env.local
 .env
 devtools
+src/model_save/best_selfplay.pt
+src/model_save/best_selfplay.pt
