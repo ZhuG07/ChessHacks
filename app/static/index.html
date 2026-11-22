@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChessHacks Engine</title>
+  <meta name="description" content="Play against a neural network chess engine: a residual policy/value network trained on Stockfish-labelled positions, driven by an alpha-beta search.">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">
+      <img src="/static/favicon.svg" alt="" width="28" height="28">
+      <span class="brand-name">ChessHacks Engine</span>
+      <span class="brand-tag">neural network + alpha-beta search</span>
+    </a>
+    <nav class="topnav">
+      <a href="#how">How it works</a>
+      <a href="/api/docs">API</a>
+      <a href="https://github.com/ZhuG07/ChessHacks" target="_blank" rel="noopener">Source</a>
+    </nav>
+  </header>
+
+  <main class="layout">
+    <section class="play" aria-label="Board">
+      <div class="player-strip" id="strip-top">
+        <div class="player">
+          <span class="player-dot" data-color="b"></span>
+          <span class="player-name">Engine</span>
+          <span class="player-sub" id="engine-level-label"></span>
+        </div>
+        <div class="captured" aria-label="Captured pieces"></div>
+      </div>
+
+      <div class="board-row">
+        <div class="evalbar" id="evalbar" role="meter" aria-label="Evaluation" aria-valuemin="0" aria-valuemax="100">
+          <div class="evalbar-fill"></div>
+          <span class="evalbar-label" id="evalbar-label">0.0</span>
+        </div>
+        <div class="board-shell">
+          <div id="board" class="board" aria-label="Chess board"></div>
+          <div class="board-overlay" id="game-over" hidden>
+            <div class="overlay-card">
+              <div class="overlay-title" id="game-over-title"></div>
+              <div class="overlay-sub" id="game-over-sub"></div>
+              <div class="overlay-actions">
+                <button class="btn primary" data-action="rematch">Play again</button>
+                <button class="btn ghost" data-action="dismiss">Review board</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="player-strip" id="strip-bottom">
+        <div class="player">
+          <span class="player-dot" data-color="w"></span>
+          <span class="player-name">You</span>
+        </div>
+        <div class="captured" aria-label="Captured pieces"></div>
+      </div>
+
+      <div class="status" id="status" aria-live="polite">Connecting to engine...</div>
+    </section>
+
+    <aside class="side">
+      <div class="card">
+        <div class="card-head">
+          <h2>New game</h2>
+        </div>
+        <div class="seg" role="radiogroup" aria-label="Play as" id="color-picker">
+          <button role="radio" data-color="w" aria-checked="true">White</button>
+          <button role="radio" data-color="b" aria-checked="false">Black</button>
+          <button role="radio" data-color="r" aria-checked="false">Random</button>
+        </div>
+        <label class="field-label" for="level-picker">Engine strength</label>
+        <div class="seg seg-4" role="radiogroup" aria-label="Engine strength" id="level-picker"></div>
+        <p class="hint" id="level-desc"></p>
+        <div class="btn-row">
+          <button class="btn primary" data-action="new">Start game</button>
+          <button class="btn" data-action="undo" title="Take back your last move">Undo</button>
+          <button class="btn" data-action="hint" title="Ask the engine for the best move">Hint</button>
+          <button class="btn" data-action="flip" title="Flip the board">Flip</button>
+          <button class="btn" data-action="watch" id="watch-btn" title="Let the engine play itself">Watch</button>
+        </div>
+      </div>
+
+      <div class="card engine-card">
+        <div class="card-head">
+          <h2>Engine thinking</h2>
+          <span class="pill" id="think-pill" hidden>thinking</span>
+        </div>
+        <div class="eval-row">
+          <div class="eval-big" id="eval-big">0.00</div>
+          <div class="eval-words" id="eval-words">Waiting for the first move.</div>
+        </div>
+        <dl class="stats">
+          <div><dt>Depth</dt><dd id="st-depth">-</dd></div>
+          <div><dt>Nodes</dt><dd id="st-nodes">-</dd></div>
+          <div><dt>Net evals</dt><dd id="st-evals">-</dd></div>
+          <div><dt>Time</dt><dd id="st-time">-</dd></div>
+        </dl>
+        <h3 class="sub-head">Top lines</h3>
+        <ol class="lines" id="lines"><li class="empty">No search yet.</li></ol>
+        <h3 class="sub-head">Network instinct <span class="muted">(raw policy, before search)</span></h3>
+        <ul class="policy" id="policy"><li class="empty">-</li></ul>
+        <p class="explain" id="explain"></p>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Moves</h2>
+          <div class="head-actions">
+            <button class="link-btn" data-action="copy-pgn">Copy PGN</button>
+            <button class="link-btn" data-action="copy-fen">Copy FEN</button>
+          </div>
+        </div>
+        <ol class="movelist" id="movelist"></ol>
+      </div>
+    </aside>
+  </main>
+
+  <section class="how" id="how">
+    <h2>How it works</h2>
+    <p class="how-lede">
+      The engine has two halves: a neural network that looks at a single position and has an opinion about it,
+      and a search that uses those opinions to look ahead. Everything below runs live on this server.
+    </p>
+    <div class="how-grid">
+      <article class="how-card">
+        <span class="how-step">01</span>
+        <h3>Training data</h3>
+        <p>
+          About 1.4 million positions, each labelled by Stockfish with its evaluation and best move.
+          Roughly 180k come from master-level games (including recent games by Ding Liren and Gukesh),
+          the rest from games played with randomised moves so the network sees unusual, unbalanced positions
+          rather than only clean opening theory.
+        </p>
+      </article>
+      <article class="how-card">
+        <span class="how-step">02</span>
+        <h3>The network</h3>
+        <p>
+          The board goes in as 18 planes of 8 by 8 (one per piece type and colour, plus side to move,
+          castling rights and en passant). A residual convolutional trunk feeds four heads: a policy over
+          all 20,480 from/to/promotion moves, a centipawn evaluation, the expected change in evaluation, and
+          the expected game result.
+        </p>
+        <p class="how-meta" id="net-meta"></p>
+      </article>
+      <article class="how-card">
+        <span class="how-step">03</span>
+        <h3>The search</h3>
+        <p>
+          Negamax with alpha-beta pruning and iterative deepening. The policy orders moves so cutoffs come
+          early, and away from the root only the network's most likely moves, plus every capture, check and
+          promotion, are explored. Leaf positions are sent to the network in batches, which is several times
+          faster on a CPU than evaluating them one at a time.
+        </p>
+        <p>
+          At the leaves, captures are played out before anything is evaluated, and the evaluation is the
+          network's opinion plus a plain material count. The network on its own sometimes misjudges positions
+          with pieces under attack, and anchoring it to material took the engine's score against a
+          strength-limited Stockfish from 8% to 40%.
+        </p>
+        <p class="how-meta" id="search-meta"></p>
+      </article>
+      <article class="how-card">
+        <span class="how-step">04</span>
+        <h3>Self-play fine-tuning</h3>
+        <p>
+          After supervised training, the engine plays itself. At every move Stockfish scores the engine's five
+          favourite candidates and the best of them becomes the training target. A quarter of the time the
+          engine deliberately plays one of the weaker candidates, so it also learns to punish and survive
+          mistakes, and only games that end in checkmate are kept.
+        </p>
+      </article>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <span>Built by <a href="https://github.com/ZhuG07" target="_blank" rel="noopener">Gordon</a>. Started at the ChessHacks hackathon.</span>
+    <span class="muted">Piece set: Chessnut by Alexis Luengas (Apache 2.0).</span>
+  </footer>
+
+  <div class="promo" id="promo" hidden>
+    <div class="promo-card" role="dialog" aria-label="Choose promotion piece"></div>
+  </div>
+  <div class="toast" id="toast" hidden></div>
+
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
