@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+.pytest_cache
+processed
+selfPlay
+tests
+devtools
+src/*.exe
+src/checkpoints_delta_resnet20
+# Only the checkpoint the app plays with goes into the image.
+src/model_save/*
+!src/model_save/best_selfplay.pt
