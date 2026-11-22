@@ -14,6 +14,7 @@ This trainer:
 """
 
 from pathlib import Path
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -27,9 +28,12 @@ import random
 # CONFIG
 # ============================================================================
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 class Config:
-    DATASET_FOLDER = "F:/VS Code Storage/ChessHacks/processed"
-    OUTPUT_DIR = "./checkpoints_delta_resnet20"
+    DATASET_FOLDER = os.getenv("DATASET_FOLDER", str(ROOT / "processed"))
+    OUTPUT_DIR = os.getenv("CHECKPOINT_DIR", str(ROOT / "src" / "checkpoints_delta_resnet20"))
     EPOCHS = 15
     BATCH_SIZE = 64
     LR = 3e-4

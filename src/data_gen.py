@@ -32,14 +32,18 @@ import chess
 import chess.engine
 import numpy as np
 from pathlib import Path
+import os
 import random
+import shutil
+
+ROOT = Path(__file__).resolve().parents[1]
 
 # =====================================================================
 # CONFIG
 # =====================================================================
 
 class Config:
-    ENGINE_PATH = r"F:/VS Code Storage/ChessHacks2025/training\whiteNoise\stockfish-windows-x86-64-avx2.exe"
+    ENGINE_PATH = os.getenv("STOCKFISH_PATH") or shutil.which("stockfish") or "stockfish"
 
     DEPTH = 12                  # use fixed depth for reproducibility
     TIME_LIMIT = None           # or e.g. 0.03 for time-based
@@ -47,7 +51,7 @@ class Config:
     MAX_MOVES_PER_GAME = 200
 
     SHARD_SIZE = 50_000         # NPZ entries per shard
-    OUTPUT_DIR = r"training\whiteNoise/processed"
+    OUTPUT_DIR = os.getenv("DATASET_FOLDER", str(ROOT / "processed"))
 
     DIRICHLET_ALPHA = 0.3
     TEMPERATURE = 1.2           # >1 = more randomness

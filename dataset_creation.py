@@ -4,17 +4,21 @@ import chess.engine
 import numpy as np
 from pathlib import Path
 from typing import Optional, Tuple
+import os
 import random
+import shutil
+
+ROOT = Path(__file__).resolve().parent
 
 # ---------- CONFIG: EDIT THESE ----------
 # Your big PGN file:
-PGN_PATH = Path(r"training\utils\LumbrasGigaBase_OTB_2015-2019.pgn")#OAWHDOIAWHDOOHAWHDOIHOIWOAHD
+PGN_PATH = Path(os.getenv("PGN_PATH", ROOT / "data" / "LumbrasGigaBase_OTB_2015-2019.pgn"))
 
 # Where to save the dataset:
-OUT_PATH = Path(r"C:\Users\ethan\Downloads\ChessHacks\e\ChessHacks\my-chesshacks-bot\processed")
+OUT_PATH = Path(os.getenv("DATASET_FOLDER", ROOT / "processed"))
 
 # Path to Stockfish binary:
-ENGINE_PATH = r"C:\Users\ethan\Downloads\ChessHacks\e\ChessHacks\my-chesshacks-bot\src\stockfish-windows-x86-64-avx2.exe"  # fix slashes or use raw string
+ENGINE_PATH = os.getenv("STOCKFISH_PATH") or shutil.which("stockfish") or "stockfish"
 
 SAMPLE_EVERY = 1      # 1 = every ply, 2 = every second ply, etc.
 MAX_GAMES = 400         # or None for all games
