@@ -23,10 +23,18 @@ function:
   * Policy pruning. Away from the root, only the most likely moves (plus
     every capture, promotion and check, and every move when in check) are
     searched. This trades a little safety for a lot of extra depth.
+  * A hybrid evaluation: the network's value plus a plain material count.
+    The network alone sometimes misjudges positions where pieces are under
+    attack, and quiescence search trusts the static evaluation when it
+    "stands pat", so those misjudgements turned into hung pieces. Anchoring
+    the evaluation to material took the engine from 8% to 40% against a
+    strength-limited Stockfish (scripts/benchmark.py).
   * MultiPV at the root, so the UI can show the top few lines with exact
     scores rather than just a single best move.
-  * Anytime behaviour. Each completed iteration is a valid answer; when the
-    clock runs out mid-iteration the last completed one is returned.
+  * Anytime behaviour. Each completed iteration is a valid answer. When the
+    clock runs out mid-iteration, any root moves that iteration did finish
+    are still used: the previous best move is searched first, so a finished
+    move that beats it is genuinely better at the new depth.
 """
 
 from __future__ import annotations
@@ -137,15 +145,36 @@ class NodeInfo:
     priors: np.ndarray           # policy probability for each legal move
 
 
+def material_balance(board: chess.Board) -> int:
+    """Material in centipawns from the side to move's point of view."""
+    total = 0
+    for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
+        diff = (chess.popcount(board.pieces_mask(piece_type, chess.WHITE))
+                - chess.popcount(board.pieces_mask(piece_type, chess.BLACK)))
+        total += diff * PIECE_VALUE[piece_type]
+    return total if board.turn == chess.WHITE else -total
+
+
 class NeuralEvaluator:
-    """Runs the network on positions and caches what it learns about them."""
+    """
+    Runs the network on positions and caches what it learns about them.
+
+    The value used by the search is the network's evaluation plus
+    `material_weight` times a plain material count. On its own the network's
+    value head explains about 68% of the variance in Stockfish's evaluations
+    of the training positions; adding material lifts that to 78%. More
+    importantly, the network sometimes misreads positions with pieces under
+    attack, and the material term keeps the search from trusting those
+    misreads.
+    """
 
     def __init__(self, model: torch.nn.Module, device: str | torch.device = "cpu",
-                 cache_size: int = 300_000):
+                 cache_size: int = 50_000, material_weight: float = 1.0):
         self.model = model
         self.device = torch.device(device)
         self.cache: OrderedDict[int, NodeInfo] = OrderedDict()
         self.cache_size = cache_size
+        self.material_weight = material_weight
         self.evals = 0
 
     def clear(self):
@@ -177,7 +206,10 @@ class NeuralEvaluator:
                     priors = lg / lg.sum()
                 else:
                     priors = np.zeros(0)
-                info = NodeInfo(float(cp[row]), float(result[row]), moves, priors)
+                value = float(cp[row])
+                if self.material_weight:
+                    value += self.material_weight * material_balance(boards[i])
+                info = NodeInfo(value, float(result[row]), moves, priors)
                 out[i] = info
                 self.cache[keys[i]] = info
 
@@ -458,24 +490,44 @@ class Searcher:
         if depth == 1:
             self._prefetch(board, root_moves)
 
-        for mv in root_moves:
-            exact_scores = sorted((s for s, _, e in scored if e), reverse=True)
-            alpha = exact_scores[k - 1] if len(exact_scores) >= k else -INF
+        try:
+            for mv in root_moves:
+                exact_scores = sorted((s for s, _, e in scored if e), reverse=True)
+                alpha = exact_scores[k - 1] if len(exact_scores) >= k else -INF
 
-            board.push(mv)
-            try:
-                score = -self._negamax(board, depth - 1, -INF, -alpha, 1)
-            finally:
-                board.pop()
+                board.push(mv)
+                try:
+                    score = -self._negamax(board, depth - 1, -INF, -alpha, 1)
+                finally:
+                    board.pop()
 
-            scored.append((score, mv, score > alpha or alpha == -INF))
+                scored.append((score, mv, score > alpha or alpha == -INF))
+        except SearchTimeout as timeout:
+            timeout.partial = scored  # the root moves this iteration did finish
+            raise
 
-        scored.sort(key=lambda t: (t[2], t[0]), reverse=True)
+        return self._to_lines(board, scored, depth, priors)
+
+    def _to_lines(self, board, scored, depth, priors) -> list[Line]:
+        scored = sorted(scored, key=lambda t: (t[2], t[0]), reverse=True)
         return [
             Line(mv, score, self._principal_variation(board, mv, depth + 4) if exact else [mv],
                  priors.get(mv, 0.0), exact)
             for score, mv, exact in scored
         ]
+
+    def _merge_partial(self, board, lines, partial, depth, priors) -> tuple[list[Line], bool]:
+        """
+        Salvage an iteration that ran out of time. Root moves are searched in
+        order of the previous iteration's scores, so the old best move goes
+        first. Once it has been searched at the new depth, any other finished
+        move that scores higher really is better at that depth.
+        """
+        if not partial or not lines or partial[0][1] != lines[0].move:
+            return lines, False
+        finished = self._to_lines(board, partial, depth, priors)
+        done = {l.move for l in finished}
+        return finished + [l for l in lines if l.move not in done], True
 
     def search(self, board: chess.Board, time_limit: float | None = None,
                max_depth: int | None = None) -> SearchResult:
@@ -509,19 +561,23 @@ class Searcher:
         for depth in range(1, max_depth + 1):
             # Depth 1 always runs to completion so there is always an answer.
             self._deadline = None if depth == 1 or time_limit is None else start + time_limit
+            iter_start = time.perf_counter()
             try:
                 lines = self._search_root(board, depth, root_moves, priors)
                 completed = depth
-            except SearchTimeout:
+            except SearchTimeout as timeout:
+                lines, _ = self._merge_partial(board, lines, getattr(timeout, "partial", []), depth, priors)
                 break
 
             root_moves = [l.move for l in lines]
             if abs(lines[0].score) >= MATE_THRESHOLD:
                 break  # forced mate found; deeper search will not change the move
             if time_limit is not None:
-                elapsed = time.perf_counter() - start
-                # The next iteration usually costs several times the last one.
-                if elapsed > time_limit * 0.4:
+                now = time.perf_counter()
+                # Only start another iteration if there is a realistic chance of
+                # finishing at least its first (most important) move, which
+                # usually costs one to two times the whole previous iteration.
+                if (start + time_limit) - now < 1.5 * (now - iter_start):
                     break
 
         self._deadline = None
